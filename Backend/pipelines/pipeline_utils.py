@@ -155,11 +155,47 @@ def _load_lifestyle_model():
             _lifestyle_model = None
     return _lifestyle_model
 
+def parse_time_to_hours(time_str):
+    try:
+        if pd.isna(time_str): return 7.0
+        time_str = str(time_str).strip().upper()
+        dt = pd.to_datetime(time_str, format="%I:%M %p", errors="coerce")
+        if pd.isna(dt):
+            dt = pd.to_datetime(time_str, format="%H:%M", errors="coerce")
+        return dt.hour + dt.minute / 60.0 if not pd.isna(dt) else 7.0
+    except Exception:
+        return 7.0
 
 def score_stress(video_features: dict, survey_data: dict) -> dict:
     """
     Computes Biometric Subscore + Kaggle Lifestyle Model Prediction -> Merges outputs.
     """
+    
+    field_mapping = {
+        "age": "Age",
+        "gender": "Gender",
+        "sleep_duration": "Sleep_Duration",
+        "sleep_hours_per_night": "Sleep_Duration",
+        "sleep_quality": "Sleep_Quality",
+        "wake_up_time": "Wake_Up_Time",
+        "bed_time": "Bed_Time",
+        "physical_activity": "Physical_Activity",
+        "screen_time": "Screen_Time",
+        "caffeine_intake": "Caffeine_Intake",
+        "alcohol_intake": "Alcohol_Intake",
+        "smoking_habit": "Smoking_Habit",
+        "work_hours": "Work_Hours",
+        "travel_time": "Travel_Time",
+        "social_interactions": "Social_Interactions",
+        "meditation_practice": "Meditation_Practice",
+        "exercise_type": "Exercise_Type",
+    }
+
+    mapped_survey = {}
+    for k, v in survey_data.items():
+        mapped_key = field_mapping.get(k.lower(), k)
+        mapped_survey[mapped_key] = v
+
     # 1. Biometric Subscore (Forehead rPPG, Voice, Behavior)
     rmssd = video_features.get("rmssd_ms", 45.0)
     s_hrv = (1.0 - (np.clip(rmssd, 20.0, 80.0) - 20.0) / 60.0) * 100.0
@@ -173,17 +209,19 @@ def score_stress(video_features: dict, survey_data: dict) -> dict:
 
     biometric_score = (0.40 * s_hrv) + (0.30 * s_voice) + (0.30 * s_behavior)
 
+    mapped_survey["Wake_Up_Time"] = parse_time_to_hours(mapped_survey.get("Wake_Up_Time"))
+    mapped_survey["Bed_Time"] = parse_time_to_hours(mapped_survey.get("Bed_Time"))
     # 2. Lifestyle Subscore (Random Forest Model)
     model = _load_lifestyle_model()
     if model is not None:
         try:
-            df_in = pd.DataFrame([survey_data])
+            df_in = pd.DataFrame([mapped_survey])
             lifestyle_score = float(model.predict(df_in)[0])
             lifestyle_score = float(np.clip(lifestyle_score, 0.0, 100.0))
         except Exception:
             lifestyle_score = 50.0
     else:
-        lifestyle_score = 50.0  # Heuristic fallback if .joblib missing
+        lifestyle_score = 50.0  # Fallback if .joblib missing
 
     # 3. Multimodal Weighted Fusion
     final_score = round(0.55 * biometric_score + 0.45 * lifestyle_score, 1)
@@ -197,8 +235,10 @@ def score_stress(video_features: dict, survey_data: dict) -> dict:
         recommendations.append("Execute 2 minutes of box breathing (4s in, 4s hold, 4s out).")
     if blink_rate > 25.0:
         key_insights.append(f"Elevated blink rate ({blink_rate} bpm) signals cognitive strain.")
-    if survey_data.get("Sleep_Duration", 8.0) < 6.5:
-        key_insights.append(f"Sleep deficit ({survey_data.get('Sleep_Duration')} hrs) exacerbates stress.")
+    
+    sleep_hours = mapped_survey.get("Sleep_Duration", 8.0)
+    if sleep_hours < 6.5:
+        key_insights.append(f"Sleep deficit ({sleep_hours} hrs) exacerbates stress.")
         recommendations.append("Prioritize 7+ hours of uninterrupted sleep.")
 
     if not key_insights:
