@@ -27,82 +27,85 @@ class InterventionPayload(BaseModel):
 @router.post("/full-evaluate")
 async def full_evaluate(
     video: UploadFile = File(...),
-    duty_hours_streak: float = Form(...),
-    relax_hours_preceding: float = Form(...),
+    # Questionnaire Form Parameters
+    age: int = Form(22),
+    gender: str = Form("Male"),
+    sleep_duration: float = Form(7.0),
+    sleep_quality: int = Form(3),
+    wake_up_time: float = Form(7.0),
+    bed_time: float = Form(23.0),
+    physical_activity: float = Form(1.0),
+    screen_time: float = Form(6.0),
+    caffeine_intake: int = Form(1),
+    alcohol_intake: int = Form(0),
+    smoking_habit: str = Form("No"),
+    work_hours: float = Form(8.0),
+    travel_time: float = Form(1.0),
+    social_interactions: float = Form(2.0),
+    meditation_practice: str = Form("No"),
+    exercise_type: str = Form("Cardio"),
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """
-    JWT (Authorization header, from /login) + one video file + the two
-    numbers the candidate types in on the same screen right before
-    recording (hours on duty, hours rested). personnel_id comes from the
-    token — nothing else needs to be sent separately.
-    """
     personnel_id = current_user["Username"]
 
     video_temp = f"temp_{video.filename}"
     with open(video_temp, "wb") as f:
         shutil.copyfileobj(video.file, f)
     try:
-        # Both run against the same uploaded file: run_opencv_processing reads
-        # the video frames, run_audio_processing_from_video demuxes and reads
-        # the audio track embedded in it — no second upload needed.
         video_metrics = await run_in_threadpool(run_opencv_processing, video_temp)
         voice_metrics = await run_in_threadpool(run_audio_processing_from_video, video_temp)
     finally:
         if os.path.exists(video_temp):
             os.remove(video_temp)
 
-    features = {
+    video_features = {
         "hr_bpm": video_metrics["hr_bpm"],
         "rmssd_ms": video_metrics["rmssd_ms"],
         "blink_rate_bpm": video_metrics["blink_rate"],
         "brow_ratio": video_metrics["brow_ratio"],
         "pitch_mean_hz": voice_metrics["pitch_mean_hz"],
         "pitch_std_hz": voice_metrics["pitch_std_hz"],
-        "duty_hours_streak": duty_hours_streak,
-        "relax_hours_preceding": relax_hours_preceding,
     }
 
-    result = score_stress(features)
+    survey_data = {
+        "Age": age,
+        "Gender": gender,
+        "Sleep_Duration": sleep_duration,
+        "Sleep_Quality": sleep_quality,
+        "Wake_Up_Time": wake_up_time,
+        "Bed_Time": bed_time,
+        "Physical_Activity": physical_activity,
+        "Screen_Time": screen_time,
+        "Caffeine_Intake": caffeine_intake,
+        "Alcohol_Intake": alcohol_intake,
+        "Smoking_Habit": smoking_habit,
+        "Work_Hours": work_hours,
+        "Travel_Time": travel_time,
+        "Social_Interactions": social_interactions,
+        "Meditation_Practice": meditation_practice,
+        "Exercise_Type": exercise_type,
+    }
+
+    result = score_stress(video_features, survey_data)
 
     session_doc = {
         "_id": gen_id(),
         "personnel_id": personnel_id,
-        "duty_hours_streak": duty_hours_streak,
-        "relax_hours_preceding": relax_hours_preceding,
-        "hr_bpm": features["hr_bpm"],
-        "rmssd_ms": features["rmssd_ms"],
-        "blink_rate_bpm": features["blink_rate_bpm"],
-        "brow_ratio": features["brow_ratio"],
-        "head_jitter": video_metrics["head_jitter"],  # logged for dashboard/history, not scored yet
-        "pitch_mean_hz": features["pitch_mean_hz"],
-        "pitch_std_hz": features["pitch_std_hz"],
+        "video_features": video_features,
+        "survey_data": survey_data,
+        "stress_score": result["final_stress_score"],
         "stress_probability": result["stress_probability"],
         "classification": result["classification"],
-        "shap_attribution": result["shap_attribution"],
         "created_at": datetime.now(timezone.utc),
     }
     db.assessment_sessions.insert_one(session_doc)
 
-    if current_user.get("role") == "candidate":
-        return {
-            "session_id": session_doc["_id"],
-            "personnel_id": personnel_id,
-            "readiness_status": result.get("readiness_status"),
-            "classification": result.get("classification"),
-            "stress_probability": result["stress_probability"],
-            "shap_attribution": result["shap_attribution"],
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    # Full technical response for commanders and medical officers
     return {
         "session_id": session_doc["_id"],
         "personnel_id": personnel_id,
-        "features_used": features,
-        **result,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        **result
     }
 
 

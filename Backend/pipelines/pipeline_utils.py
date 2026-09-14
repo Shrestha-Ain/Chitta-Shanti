@@ -1,12 +1,12 @@
+import os
+import joblib
 import numpy as np
+import pandas as pd
 from scipy import signal as sps
 import librosa
-import joblib
-import os
-
 
 # ---------------------------------------------------------
-# 1. rPPG & HRV Processing
+# 1. Biometric Signal Processing Functions
 # ---------------------------------------------------------
 def pos_algorithm(rgb_signal, fps):
     rgb_signal = np.asarray(rgb_signal, dtype=np.float64)
@@ -27,8 +27,7 @@ def pos_algorithm(rgb_signal, fps):
         Xs = 3 * normalized[:, 0] - 2 * normalized[:, 1]
         Ys = 1.5 * normalized[:, 0] + normalized[:, 1] - 1.5 * normalized[:, 2]
 
-        std_x = np.std(Xs)
-        std_y = np.std(Ys)
+        std_x, std_y = np.std(Xs), np.std(Ys)
         alpha = std_x / std_y if std_y > 1e-8 else 0
 
         S = Xs - alpha * Ys
@@ -87,27 +86,13 @@ def estimate_hr_and_hrv(pulse_signal, fps):
     }
 
 
-# ---------------------------------------------------------
-# 2. Eye Aspect Ratio & Blink Engine
-# ---------------------------------------------------------
 def eye_aspect_ratio(eye_pts):
     p1, p2, p3, p4, p5, p6 = eye_pts
     return (np.linalg.norm(p2 - p6) + np.linalg.norm(p3 - p5)) / (2.0 * np.linalg.norm(p1 - p4) + 1e-6)
 
 
-EAR_BLINK_THRESHOLD = 0.21
-EAR_CONSEC_FRAMES = 2
-
-
 class BlinkCounter:
-    """
-    Tracks EAR across consecutive frames and counts a blink whenever EAR dips
-    below threshold for at least `consec_frames` in a row, then recovers.
-    Call .update(ear) per processed frame, .finalize() once at the end to
-    flush a blink that was still in progress when the video ended.
-    """
-
-    def __init__(self, threshold: float = EAR_BLINK_THRESHOLD, consec_frames: int = EAR_CONSEC_FRAMES):
+    def __init__(self, threshold: float = 0.21, consec_frames: int = 2):
         self.threshold = threshold
         self.consec_frames = consec_frames
         self._below_count = 0
@@ -128,35 +113,24 @@ class BlinkCounter:
         return self.blink_count
 
 
-# ---------------------------------------------------------
-# 3. Voice Feature Extraction (Acoustic Stress Biomarkers)
-# ---------------------------------------------------------
 def extract_voice_stress_features(audio_data, sr=22050):
-    """
-    Extracts fundamental frequency (F0), jitter approximation,
-    spectral centroid, and energy variance using librosa.
-    """
     if len(audio_data) < sr * 1:
         return {"pitch_mean_hz": 0.0, "pitch_std_hz": 0.0, "vocal_stress_subscore": 50.0}
 
     audio_data = audio_data / (np.max(np.abs(audio_data)) + 1e-6)
-
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        audio_data, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr
-    )
+    f0, _, _ = librosa.pyin(audio_data, fmin=librosa.note_to_hz("C2"), fmax=librosa.note_to_hz("C7"), sr=sr)
     valid_f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
 
     if len(valid_f0) > 5:
-        pitch_mean = float(np.mean(valid_f0))
-        pitch_std = float(np.std(valid_f0))
+        pitch_mean, pitch_std = float(np.mean(valid_f0)), float(np.std(valid_f0))
     else:
         pitch_mean, pitch_std = 120.0, 5.0
 
     spec_cent = librosa.feature.spectral_centroid(y=audio_data, sr=sr)
-    mean_spectral_centroid = float(np.mean(spec_cent))
+    mean_spec_cent = float(np.mean(spec_cent))
 
     s_pitch_var = np.clip((pitch_std - 15.0) / (45.0 - 15.0) * 100.0, 0, 100)
-    s_spectral = np.clip((mean_spectral_centroid - 1200.0) / (2800.0 - 1200.0) * 100.0, 0, 100)
+    s_spectral = np.clip((mean_spec_cent - 1200.0) / (2800.0 - 1200.0) * 100.0, 0, 100)
     vocal_subscore = 0.60 * s_pitch_var + 0.40 * s_spectral
 
     return {
@@ -167,201 +141,86 @@ def extract_voice_stress_features(audio_data, sr=22050):
 
 
 # ---------------------------------------------------------
-# 4. Multi-Modal ML Classification (SVM + SHAP, with fallback)
+# 2. Multimodal Fusion Engine (Biometric + Kaggle RF)
 # ---------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "..", "models", "lifestyle_stress_model.joblib")
+_lifestyle_model = None
 
-_MODEL_PATH = os.getenv("STRESS_MODEL_PATH", "models/stress_svm.joblib")
-_SCALER_PATH = os.getenv("STRESS_SCALER_PATH", "models/stress_scaler.joblib")
-_EXPLAINER_PATH = os.getenv("STRESS_EXPLAINER_PATH", "models/stress_explainer.joblib")
-
-_FEATURE_ORDER = [
-    "hr_bpm", "rmssd_ms", "pitch_mean_hz", "pitch_std_hz",
-    "blink_rate_bpm", "brow_ratio", "duty_hours_streak", "relax_hours_preceding",
-]
-
-_model = None
-_scaler = None
-_explainer = None
-_model_load_attempted = False
+def _load_lifestyle_model():
+    global _lifestyle_model
+    if _lifestyle_model is None and os.path.exists(MODEL_PATH):
+        try:
+            _lifestyle_model = joblib.load(MODEL_PATH)
+        except Exception:
+            _lifestyle_model = None
+    return _lifestyle_model
 
 
-def _try_load_model():
-    global _model, _scaler, _explainer, _model_load_attempted
-    if _model_load_attempted:
-        return
-    _model_load_attempted = True
-    try:
-        _model = joblib.load(_MODEL_PATH)
-        _scaler = joblib.load(_SCALER_PATH)
-        if os.path.exists(_EXPLAINER_PATH):
-            _explainer = joblib.load(_EXPLAINER_PATH)
-    except Exception:
-        _model, _scaler, _explainer = None, None, None
-
-
-def _heuristic_score(features: dict) -> dict:
+def score_stress(video_features: dict, survey_data: dict) -> dict:
     """
-    Deterministic weighted fallback — used until a trained SVM exists.
-    Matches the ML teammate's actual fuse_multimodal_scores() formula from
-    main_pipeline.py: 40% HRV + 30% voice + 30% behavior, where behavior
-    itself is 60% blink-rate + 40% brow tension.
+    Computes Biometric Subscore + Kaggle Lifestyle Model Prediction -> Merges outputs.
     """
-    s_hrv = max(0.0, min(100.0, (1.0 - (features["rmssd_ms"] - 20.0) / 60.0) * 100.0))
-    s_voice = min(100.0, max(0.0, features["pitch_std_hz"] * 4.0))
+    # 1. Biometric Subscore (Forehead rPPG, Voice, Behavior)
+    rmssd = video_features.get("rmssd_ms", 45.0)
+    s_hrv = (1.0 - (np.clip(rmssd, 20.0, 80.0) - 20.0) / 60.0) * 100.0
+    s_voice = min(100.0, max(0.0, video_features.get("pitch_std_hz", 5.0) * 4.0))
 
-    s_blink = max(0.0, min(100.0, (features["blink_rate_bpm"] - 14.0) / (32.0 - 14.0) * 100.0))
-    brow_ratio = features.get("brow_ratio", 0.20)  # lower ratio = more furrowed/tense
-    s_brow = max(0.0, min(100.0, (0.22 - brow_ratio) / (0.22 - 0.14) * 100.0))
+    blink_rate = video_features.get("blink_rate_bpm", 18.0)
+    brow_ratio = video_features.get("brow_ratio", 0.22)
+    s_blink = np.clip((blink_rate - 14.0) / (32.0 - 14.0) * 100.0, 0, 100)
+    s_brow = np.clip((0.22 - brow_ratio) / (0.22 - 0.14) * 100.0, 0, 100)
     s_behavior = 0.60 * s_blink + 0.40 * s_brow
 
-    rest_deficit = features["relax_hours_preceding"] < 4.0
+    biometric_score = (0.40 * s_hrv) + (0.30 * s_voice) + (0.30 * s_behavior)
 
-    overall = (0.40 * s_hrv) + (0.30 * s_voice) + (0.30 * s_behavior)
-    probability = min(0.97, max(overall, 65.0 if rest_deficit else 0.0) / 100.0)
-    is_critical = probability >= 0.65 or rest_deficit
+    # 2. Lifestyle Subscore (Random Forest Model)
+    model = _load_lifestyle_model()
+    if model is not None:
+        try:
+            df_in = pd.DataFrame([survey_data])
+            lifestyle_score = float(model.predict(df_in)[0])
+            lifestyle_score = float(np.clip(lifestyle_score, 0.0, 100.0))
+        except Exception:
+            lifestyle_score = 50.0
+    else:
+        lifestyle_score = 50.0  # Heuristic fallback if .joblib missing
 
-    shap_breakdown = sorted(
-        [
-            {"feature": "relax_hours_preceding", "importance": round(0.38 if rest_deficit else 0.10, 2),
-            "description": "Rest deficit in preceding 48h"},
-            {"feature": "rmssd_ms", "importance": round(s_hrv / 100 * 0.4, 2),
-            "description": "Depressed autonomic recovery (HRV)"},
-            {"feature": "pitch_std_hz", "importance": round(s_voice / 100 * 0.3, 2),
-            "description": "Vocal micro-tremor dispersion"},
-            {"feature": "blink_rate_bpm", "importance": round(s_blink / 100 * 0.3 * 0.6, 2),
-            "description": "Elevated blink rate"},
-            {"feature": "brow_ratio", "importance": round(s_brow / 100 * 0.3 * 0.4, 2),
-            "description": "Brow furrowing / facial tension"},
-        ],
-        key=lambda f: f["importance"],
-        reverse=True,
-    )[:3]
+    # 3. Multimodal Weighted Fusion
+    final_score = round(0.55 * biometric_score + 0.45 * lifestyle_score, 1)
+    stress_prob = round(final_score / 100.0, 2)
+    is_critical = final_score >= 65.0
+
+    # Insights & Recommendations Generation
+    key_insights, recommendations = [], []
+    if rmssd < 30.0:
+        key_insights.append(f"Low HRV (RMSSD: {rmssd}ms) indicates autonomic fatigue.")
+        recommendations.append("Execute 2 minutes of box breathing (4s in, 4s hold, 4s out).")
+    if blink_rate > 25.0:
+        key_insights.append(f"Elevated blink rate ({blink_rate} bpm) signals cognitive strain.")
+    if survey_data.get("Sleep_Duration", 8.0) < 6.5:
+        key_insights.append(f"Sleep deficit ({survey_data.get('Sleep_Duration')} hrs) exacerbates stress.")
+        recommendations.append("Prioritize 7+ hours of uninterrupted sleep.")
+
+    if not key_insights:
+        key_insights.append("Biometric markers and lifestyle habits are balanced.")
+        recommendations.append("Maintain existing recovery and sleep routine.")
 
     return {
         "classification": "Critical Fatigue" if is_critical else "Cleared",
         "readiness_status": "Mandatory Rest Required" if is_critical else "Fit for Duty",
-        "stress_probability": round(probability, 2),
-        "shap_attribution": shap_breakdown,
-        "scoring_method": "heuristic_fallback",
-    }
-
-
-def score_stress(features: dict) -> dict:
-    """
-    Scores a 7-feature vector (see _FEATURE_ORDER for required keys).
-    Uses the trained RBF-SVM + SHAP explainer if present in ./models/,
-    otherwise falls back to _heuristic_score so the pipeline never breaks.
-    """
-    _try_load_model()
-
-    if _model is not None and _scaler is not None:
-        try:
-            x = [[features[k] for k in _FEATURE_ORDER]]
-            x_scaled = _scaler.transform(x)
-            proba = _model.predict_proba(x_scaled)[0]
-            classes = list(_model.classes_)
-            critical_idx = classes.index(1) if 1 in classes else int(np.argmax(proba))
-            probability = float(proba[critical_idx])
-            is_critical = probability >= 0.5
-
-            shap_breakdown = []
-            if _explainer is not None:
-                try:
-                    shap_values = _explainer.shap_values(x_scaled)
-                    contributions = shap_values[critical_idx][0] if isinstance(shap_values, list) else shap_values[0]
-                    ranked = sorted(zip(_FEATURE_ORDER, contributions), key=lambda p: abs(p[1]), reverse=True)[:3]
-                    shap_breakdown = [
-                        {"feature": name, "importance": round(float(val), 3),
-                        "description": f"SHAP contribution for {name}"}
-                        for name, val in ranked
-                    ]
-                except Exception:
-                    shap_breakdown = []
-
-            return {
-                "classification": "Critical Fatigue" if is_critical else "Cleared",
-                "readiness_status": "Mandatory Rest Required" if is_critical else "Fit for Duty",
-                "stress_probability": round(probability, 2),
-                "shap_attribution": shap_breakdown,
-                "scoring_method": "svm_model",
-            }
-        except Exception:
-            pass
-
-    return _heuristic_score(features)
-
-
-# ---------------------------------------------------------
-# 5. Generative AI Context Engine (Gemini 2.5 Flash + fallback)
-# ---------------------------------------------------------
-_FALLBACK_QUESTIONS = [
-    "On a scale of 1 to 10, how would you rate your energy level right now?",
-    "Have you had any trouble sleeping in the past two nights?",
-    "Do you feel any unusual tension or discomfort at this moment?",
-]
-
-
-def generate_adaptive_question(hr_bpm: float, rmssd_ms: float, baseline_hr_bpm: float = None) -> dict:
-    """
-    Calls Gemini 2.5 Flash to generate a targeted follow-up question based on
-    Stage-1 HR/HRV anomalies. Uses the `google-genai` SDK (google.genai) —
-    matching the ML teammate's actual working implementation in
-    main_pipeline.py's generate_adaptive_prompt(), NOT the older
-    google-generativeai package. Falls back to a fixed question with zero
-    latency if GEMINI_API_KEY is missing, the request fails, or times out.
-
-    Not currently wired to a live endpoint (no mid-recording pause in the
-    single-upload flow) — kept here ready to use if that feature comes back.
-    """
-    import random
-    import json
-
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return {"question": _FALLBACK_QUESTIONS[0], "source": "fallback"}
-
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=api_key)
-
-        topics = [
-            "recent sleep quality and physical recovery",
-            "current cognitive workload and focus",
-            "recent feelings of being rushed or overwhelmed",
-            "ability to disconnect and relax after a long day",
-            "recent changes in appetite or daily routine",
+        "stress_probability": stress_prob,
+        "final_stress_score": final_score,
+        "subscore_breakdown": {
+            "biometric_score": round(biometric_score, 1),
+            "lifestyle_score": round(lifestyle_score, 1),
+            "hrv_subscore": round(s_hrv, 1),
+            "voice_subscore": round(s_voice, 1),
+            "behavior_subscore": round(s_behavior, 1)
+        },
+        "key_insights": key_insights,
+        "actionable_recommendations": recommendations,
+        "shap_attribution": [
+            {"feature": "Biometric Biomarkers", "importance": round(biometric_score * 0.55 / 100, 2), "description": "Real-time facial/vocal biomarkers"},
+            {"feature": "Lifestyle Factors", "importance": round(lifestyle_score * 0.45 / 100, 2), "description": "Reported sleep, workload, and habits"}
         ]
-        chosen_topic = random.choice(topics)
-
-        prompt = f"""
-        You are an objective clinical screening assistant.
-        The candidate has completed their baseline scan:
-        - Resting HR: {hr_bpm} BPM
-        - HRV (RMSSD): {rmssd_ms} ms (Lower = higher strain)
-
-        Generate exactly ONE targeted question to assess their {chosen_topic}.
-        Keep the question conversational, under 20 words, and do not use standard greetings.
-
-        Return JSON with this exact schema:
-        {{
-           "question_text": "...",
-           "focus_area": "{chosen_topic}"
-        }}
-        """
-        response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.8,
-            ),
-        )
-        parsed = json.loads(response.text)
-        question = parsed.get("question_text", "").strip()
-        if not question:
-            raise ValueError("Empty question_text from Gemini")
-        return {"question": question, "source": "gemini"}
-    except Exception:
-        return {"question": _FALLBACK_QUESTIONS[1], "source": "fallback"}
+    }
