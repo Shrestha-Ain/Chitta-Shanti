@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { registerUser } from "../../api/authApi";
 import {
   ArrowRight,
   BadgeCheck,
@@ -21,6 +22,10 @@ export default function RegisterForm() {
     unitId: "",
   });
 
+  const [loading, setLoading] = useState(false);
+const [error, setError] = useState("");
+const [success, setSuccess] = useState("");
+
   const handleChange = (event) => {
     const { name, value } = event.target;
 
@@ -30,15 +35,43 @@ export default function RegisterForm() {
     }));
   };
 
-  const handleSubmit = (event) => {
-    event.preventDefault();
+const handleSubmit = async (event) => {
+  event.preventDefault();
 
-    /*
-     * Backend registration will be connected here
-     * after the exact registration API contract is confirmed.
-     */
-    console.log("Registration submitted:", formData);
-  };
+  setError("");
+  setSuccess("");
+
+  try {
+    setLoading(true);
+
+    await registerUser(formData);
+
+    setSuccess(
+      "Registration successful. Redirecting to login..."
+    );
+
+    setFormData({
+      username: "",
+      fullName: "",
+      password: "",
+      role: "",
+      unitId: "",
+    });
+
+    setTimeout(() => {
+      navigate("/login", { replace: true });
+    }, 1000);
+  } catch (err) {
+    console.error("Registration failed:", err);
+
+    setError(
+      err?.message ||
+        "Unable to register. Please try again."
+    );
+  } finally {
+    setLoading(false);
+  }
+};
 
   return (
     <div
@@ -115,6 +148,42 @@ export default function RegisterForm() {
         onSubmit={handleSubmit}
         className="mt-8 space-y-5"
       >
+
+        {error && (
+  <div
+    className="
+      rounded-xl
+      border
+      border-red-200
+      bg-red-50
+      px-4
+      py-3
+      text-sm
+      font-medium
+      text-red-700
+    "
+  >
+    {error}
+  </div>
+)}
+
+{success && (
+  <div
+    className="
+      rounded-xl
+      border
+      border-green-200
+      bg-green-50
+      px-4
+      py-3
+      text-sm
+      font-medium
+      text-green-700
+    "
+  >
+    {success}
+  </div>
+)}
         {/* Username */}
         <RegisterField
           icon={UserRound}
@@ -169,7 +238,8 @@ export default function RegisterForm() {
         {/* Register button */}
         <div className="flex justify-center pt-3">
           <button
-            type="submit"
+  type="submit"
+  disabled={loading}
             className="
               flex
               w-full
@@ -192,7 +262,9 @@ export default function RegisterForm() {
               sm:w-2/3
             "
           >
-            <span>Register</span>
+            <span>
+  {loading ? "Registering..." : "Register"}
+</span>
 
             <ArrowRight
               size={19}
